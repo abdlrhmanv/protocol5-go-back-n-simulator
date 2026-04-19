@@ -1,0 +1,17 @@
+{
+  "code-runner.runInTerminal": true,
+  "code-runner.saveAllFilesBeforeRun": true,
+  "code-runner.clearPreviousOutput": true,
+  "code-runner.fileDirectoryAsCwd": false,
+  "code-runner.cwd": "${workspaceFolder}",
+  "code-runner.executorMap": {
+    "cpp": "cd $dir/.. && g++ -std=c++17 -O2 -Wall -Wextra -pedantic -Iinclude src/main.cpp src/Sender.cpp src/Receiver.cpp src/Channel.cpp src/Timer.cpp -o protocol5_sim && ./protocol5_sim"
+  },
+  "code-runner.executorMapByFileExtension": {
+    ".cpp": "cd $dir/.. && g++ -std=c++17 -O2 -Wall -Wextra -pedantic -Iinclude src/main.cpp src/Sender.cpp src/Receiver.cpp src/Channel.cpp src/Timer.cpp -o protocol5_sim && ./protocol5_sim",
+    ".h":   "cd $dir/.. && g++ -std=c++17 -O2 -Wall -Wextra -pedantic -Iinclude src/main.cpp src/Sender.cpp src/Receiver.cpp src/Channel.cpp src/Timer.cpp -o protocol5_sim && ./protocol5_sim"
+  },
+  "files.associations": {
+    "*.h": "cpp"
+  }
+}
