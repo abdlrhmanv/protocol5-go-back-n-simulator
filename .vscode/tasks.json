@@ -1,0 +1,85 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build (debug)",
+      "type": "shell",
+      "command": "g++",
+      "args": [
+        "-std=c++17",
+        "-g",
+        "-O0",
+        "-Wall",
+        "-Wextra",
+        "-pedantic",
+        "-Iinclude",
+        "src/main.cpp",
+        "src/Sender.cpp",
+        "src/Receiver.cpp",
+        "src/Channel.cpp",
+        "src/Timer.cpp",
+        "-o",
+        "${workspaceFolder}/protocol5_sim"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gcc"],
+      "detail": "Compile Protocol 5 simulator with debug symbols."
+    },
+    {
+      "label": "build (release)",
+      "type": "shell",
+      "command": "g++",
+      "args": [
+        "-std=c++17",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-pedantic",
+        "-Iinclude",
+        "src/main.cpp",
+        "src/Sender.cpp",
+        "src/Receiver.cpp",
+        "src/Channel.cpp",
+        "src/Timer.cpp",
+        "-o",
+        "${workspaceFolder}/protocol5_sim"
+      ],
+      "group": "build",
+      "problemMatcher": ["$gcc"],
+      "detail": "Compile Protocol 5 simulator with optimizations."
+    },
+    {
+      "label": "run (default scenario)",
+      "type": "shell",
+      "command": "${workspaceFolder}/protocol5_sim",
+      "args": ["0", "0", "12", "8000", "0", "1"],
+      "dependsOn": "build (debug)",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "panel": "new",
+        "clear": true
+      },
+      "problemMatcher": [],
+      "detail": "Build then run the happy-path scenario."
+    },
+    {
+      "label": "run (loss + corrupt)",
+      "type": "shell",
+      "command": "${workspaceFolder}/protocol5_sim",
+      "args": ["20", "20", "12", "30000", "20", "7"],
+      "dependsOn": "build (debug)",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "panel": "new",
+        "clear": true
+      },
+      "problemMatcher": [],
+      "detail": "Build then run the loss + corruption scenario."
+    }
+  ]
+}

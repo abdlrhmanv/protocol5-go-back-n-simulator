@@ -1,228 +1,155 @@
 // =============================================================================
-// channel.cpp
+// Channel.cpp
 // -----------------------------------------------------------------------------
-// Lossy/delayed channel model that transports data frames and ACKs.
+// Bidirectional channel that carries the unified `frame` between the sender
+// (A) and the receiver (B). Models:
+//   * Per-frame transmission time (TRANSMISSION_TIME)
+//   * One-way propagation delay   (PROP_DELAY)
+//   * Probabilistic loss          (set_frame_loss_probability)
+//   * Probabilistic corruption    (set_frame_corrupt_probability)
+//
+// Corrupted frames are still delivered, but `kind` is replaced by FK_DATA and
+// the delivery callback receives a frame whose `seq`/`ack` have been
+// scrambled. The protocol layer treats this as a `cksum_err` event (in GBN,
+// "just ignore bad frames").
 // =============================================================================
 
-#include <iostream>   // Provides std::cout/std::endl for channel trace logs.
-#include <vector>     // Provides std::vector for in-flight packet queues.
-#include <cstdlib>    // Provides rand() and srand() for loss simulation.
-#include <ctime>      // Provides time() for one-time random seed.
-#include "Channel.h"  // Channel interface and callback type declarations.
-#include "Header.h"   // Shared Frame/Ack definitions and constants.
+#include <iostream>
+#include <random>
+#include <vector>
+#include <ctime>
+#include "Channel.h"
 
-using namespace std;  // Keeps implementation concise for coursework context.
-
-// Represents a data frame currently traveling through the channel.
+namespace
+{
 struct InFlightFrame
 {
-    // Payload frame object.
-    Frame frame;
-    // Simulation time when this frame should be delivered.
-    int delivery_time;
+    frame      pkt;
+    direction  dir;
+    int        delivery_time_ms;
+    bool       corrupted;
 };
 
-// Represents an ACK currently traveling through the channel.
-struct InFlightAck
+std::vector<InFlightFrame> g_in_flight;
+
+FrameDeliveryCallback g_a_to_b_cb = nullptr;
+FrameDeliveryCallback g_b_to_a_cb = nullptr;
+
+double g_loss_pct    = 0.0;
+double g_corrupt_pct = 0.0;
+
+std::mt19937 g_rng;
+bool         g_rng_initialized = false;
+
+double rand_pct()
 {
-    // ACK payload object.
-    Ack ack;
-    // Simulation time when this ACK should be delivered.
-    int delivery_time;
-};
-
-// Queue of data frames waiting for delivery time.
-static vector<InFlightFrame> frame_queue;
-// Queue of ACKs waiting for delivery time.
-static vector<InFlightAck> ack_queue;
-
-// Callback invoked when a frame reaches receiver side.
-static FrameDeliveryCallback receiver_callback = nullptr;
-// Callback invoked when an ACK reaches sender side.
-static AckDeliveryCallback sender_ack_callback = nullptr;
-
-// Channel's notion of current simulation time.
-static int channel_current_time = 0;
-// Probability (percentage) of dropping a data frame.
-static double frame_loss_probability = 0.0;
-// Probability (percentage) of dropping an ACK.
-static double ack_loss_probability = 0.0;
-
-// Flag to avoid reseeding pseudo-random generator repeatedly.
-static bool random_initialized = false;
-
-// Seeds PRNG once using wall-clock time.
-static void initialize_random_once()
-{
-    // Only seed if not already seeded.
-    if (!random_initialized)
+    if (!g_rng_initialized)
     {
-        // Initialize pseudo-random generator seed.
-        srand((unsigned int)time(nullptr));
-        // Mark initialization completed.
-        random_initialized = true;
+        g_rng.seed(static_cast<unsigned int>(std::time(nullptr)));
+        g_rng_initialized = true;
     }
+    std::uniform_real_distribution<double> dist(0.0, 100.0);
+    return dist(g_rng);
 }
 
-// Returns true if packet should be dropped for a given percentage.
-static bool is_lost(double percent)
+bool sample_event(double pct)
 {
-    // Ensure random generator is seeded before sampling.
-    initialize_random_once();
-    // Generate pseudo-random value in [0.00, 99.99].
-    double r = (rand() % 10000) / 100.0;
-    // Decide drop if sample falls below requested percentage.
-    return (r < percent);
+    if (pct <= 0.0)   return false;
+    if (pct >= 100.0) return true;
+    return rand_pct() < pct;
 }
 
-// Registers receiver callback for frame deliveries.
-void register_receiver(FrameDeliveryCallback cb)
+const char* dir_arrow(direction d)
 {
-    // Save receiver callback pointer.
-    receiver_callback = cb;
+    return d == DIR_AB ? "A->B" : "B->A";
+}
 }
 
-// Registers sender callback for ACK deliveries.
-void register_sender_ack(AckDeliveryCallback cb)
+void register_a_to_b(FrameDeliveryCallback cb) { g_a_to_b_cb = cb; }
+void register_b_to_a(FrameDeliveryCallback cb) { g_b_to_a_cb = cb; }
+
+void set_frame_loss_probability(double percent)    { g_loss_pct    = percent; }
+void set_frame_corrupt_probability(double percent) { g_corrupt_pct = percent; }
+
+void channel_seed(unsigned int seed)
 {
-    // Save sender callback pointer.
-    sender_ack_callback = cb;
+    if (seed == 0)
+        g_rng.seed(static_cast<unsigned int>(std::time(nullptr)));
+    else
+        g_rng.seed(seed);
+    g_rng_initialized = true;
 }
 
-// Configures frame drop probability.
-void set_frame_loss_probability(double percent)
+void send_to_channel(frame f, direction d, int current_time)
 {
-    // Store frame loss percentage.
-    frame_loss_probability = percent;
-}
+    const char* kind_str = (f.kind == FK_DATA) ? "DATA" : "ACK ";
 
-// Configures ACK drop probability.
-void set_ack_loss_probability(double percent)
-{
-    // Store ACK loss percentage.
-    ack_loss_probability = percent;
-}
-
-// Updates channel clock reference used for enqueue timestamps.
-void set_channel_time(int current_time)
-{
-    // Record current simulation time.
-    channel_current_time = current_time;
-}
-
-// Enqueues one frame for delayed delivery (or probabilistic drop).
-void send_to_channel(Frame f)
-{
-    // Apply frame loss model before enqueueing.
-    if (is_lost(frame_loss_probability))
+    if (sample_event(g_loss_pct))
     {
-        // Log dropped frame event.
-        cout << "t=" << channel_current_time
-             << ": CHANNEL lost frame " << f.seq_num << endl;
-        // Abort enqueue for dropped frame.
+        std::cout << "t=" << current_time
+                  << ": CHANNEL [" << dir_arrow(d) << "] LOST "
+                  << kind_str << " seq=" << f.seq << " ack=" << f.ack
+                  << std::endl;
         return;
     }
 
-    // Prepare queue element for in-flight frame.
     InFlightFrame item;
-    // Copy frame payload into queue element.
-    item.frame = f;
-    // Compute target delivery time using propagation delay.
-    item.delivery_time = channel_current_time + PROP_DELAY;
-    // Push item into in-flight frame queue.
-    frame_queue.push_back(item);
+    item.pkt              = f;
+    item.dir              = d;
+    item.delivery_time_ms = current_time + TRANSMISSION_TIME + PROP_DELAY;
+    item.corrupted        = sample_event(g_corrupt_pct);
+    g_in_flight.push_back(item);
 
-    // Log accepted frame and expected delivery timestamp.
-    cout << "t=" << channel_current_time
-         << ": CHANNEL accepted frame " << f.seq_num
-         << ", will reach receiver at t=" << item.delivery_time << endl;
+    std::cout << "t=" << current_time
+              << ": CHANNEL [" << dir_arrow(d) << "] accepted "
+              << kind_str << " seq=" << f.seq << " ack=" << f.ack
+              << ", arrives at t=" << item.delivery_time_ms
+              << (item.corrupted ? " [WILL ARRIVE CORRUPTED]" : "")
+              << std::endl;
 }
 
-// Enqueues one ACK for delayed delivery (or probabilistic drop).
-void send_ack_to_channel(Ack a)
-{
-    // Apply ACK loss model before enqueueing.
-    if (is_lost(ack_loss_probability))
-    {
-        // Log dropped ACK event.
-        cout << "t=" << channel_current_time
-             << ": CHANNEL lost ACK " << a.ack_num << endl;
-        // Abort enqueue for dropped ACK.
-        return;
-    }
-
-    // Prepare queue element for in-flight ACK.
-    InFlightAck item;
-    // Copy ACK payload into queue element.
-    item.ack = a;
-    // Compute target delivery time using propagation delay.
-    item.delivery_time = channel_current_time + PROP_DELAY;
-    // Push item into in-flight ACK queue.
-    ack_queue.push_back(item);
-
-    // Log accepted ACK and expected delivery timestamp.
-    cout << "t=" << channel_current_time
-         << ": CHANNEL accepted ACK " << a.ack_num
-         << ", will reach sender at t=" << item.delivery_time << endl;
-}
-
-// Delivers all due frames/ACKs whose delivery_time <= current_time.
 void process_channel(int current_time)
 {
-    // Synchronize channel's local clock with simulation time.
-    channel_current_time = current_time;
-
-    // Scan frame queue and deliver any frame whose delay has expired.
-    for (int i = 0; i < (int)frame_queue.size(); )
+    for (size_t i = 0; i < g_in_flight.size(); )
     {
-        // Check whether current queued frame is due now.
-        if (frame_queue[i].delivery_time <= current_time)
+        if (g_in_flight[i].delivery_time_ms <= current_time)
         {
-            // Copy due frame payload.
-            Frame f = frame_queue[i].frame;
-            // Log frame delivery event.
-            cout << "t=" << current_time
-                 << ": CHANNEL delivered frame " << f.seq_num
-                 << " to receiver" << endl;
+            InFlightFrame item = g_in_flight[i];
+            g_in_flight.erase(g_in_flight.begin() + static_cast<long>(i));
 
-            // Invoke receiver callback if it has been registered.
-            if (receiver_callback != nullptr)
-                receiver_callback(f, current_time);
+            frame f      = item.pkt;
+            f.corrupt    = item.corrupted;
+            if (item.corrupted)
+            {
+                std::cout << "t=" << current_time
+                          << ": CHANNEL [" << dir_arrow(item.dir)
+                          << "] delivered CORRUPT frame "
+                          << "(orig seq=" << f.seq << " ack=" << f.ack << ")"
+                          << std::endl;
+            }
+            else
+            {
+                std::cout << "t=" << current_time
+                          << ": CHANNEL [" << dir_arrow(item.dir)
+                          << "] delivered "
+                          << (f.kind == FK_DATA ? "DATA" : "ACK ")
+                          << " seq=" << f.seq << " ack=" << f.ack
+                          << std::endl;
+            }
 
-            // Remove delivered frame from queue without incrementing i.
-            frame_queue.erase(frame_queue.begin() + i);
+            FrameDeliveryCallback cb =
+                (item.dir == DIR_AB) ? g_a_to_b_cb : g_b_to_a_cb;
+            if (cb != nullptr)
+                cb(f, current_time);
         }
         else
         {
-            // Move to next queued frame when current one is not due yet.
-            i++;
+            ++i;
         }
     }
+}
 
-    // Scan ACK queue and deliver any ACK whose delay has expired.
-    for (int i = 0; i < (int)ack_queue.size(); )
-    {
-        // Check whether current queued ACK is due now.
-        if (ack_queue[i].delivery_time <= current_time)
-        {
-            // Copy due ACK payload.
-            Ack a = ack_queue[i].ack;
-            // Log ACK delivery event.
-            cout << "t=" << current_time
-                 << ": CHANNEL delivered ACK " << a.ack_num
-                 << " to sender" << endl;
-
-            // Invoke sender callback if it has been registered.
-            if (sender_ack_callback != nullptr)
-                sender_ack_callback(a.ack_num, current_time);
-
-            // Remove delivered ACK from queue without incrementing i.
-            ack_queue.erase(ack_queue.begin() + i);
-        }
-        else
-        {
-            // Move to next queued ACK when current one is not due yet.
-            i++;
-        }
-    }
+void channel_reset()
+{
+    g_in_flight.clear();
 }

@@ -1,3 +1,35 @@
+# Build artifacts
 protocol5_sim
 *.o
 *.out
+*.exe
+*.obj
+*.a
+*.so
+*.dylib
+
+# Debug symbols
+*.dSYM/
+*.pdb
+*.ilk
+
+# clangd / language server caches and generated configs
+.cache/
+.clangd/
+compile_commands.json
+
+# Editor/IDE local state
+*.swp
+*.swo
+*~
+.DS_Store
+
+# CMake (in case anyone adds CMake later)
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Run captures (regenerated on demand)
+runs/

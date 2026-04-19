@@ -1,146 +1,133 @@
 // =============================================================================
-// sender.cpp
+// Sender.cpp
 // -----------------------------------------------------------------------------
-// Sender-side implementation for Protocol 5 (Go-Back-N behavior).
+// Sender side of Protocol 5 (Go-Back-N), structured to mirror the textbook's
+// Fig. 3.19 implementation:
+//
+//   - All sequence-number arithmetic is modulo (MAX_SEQ + 1).
+//   - The window check uses the helper `between()`.
+//   - Outgoing packets are kept in a circular buffer of NR_BUFS slots and
+//     indexed by `seq % NR_BUFS`.
+//   - Each outstanding frame has its own timer (Fig. 3.20). On a timeout for
+//     the oldest frame the sender retransmits all frames in [ack_expected,
+//     next_frame_to_send) -- the GBN "go back to N" behavior.
+//   - Bad frames are silently ignored (the textbook GBN cksum_err handler).
 // =============================================================================
 
-#include <iostream>   // Provides std::cout and std::endl for trace logging.
-#include <vector>     // Provides std::vector for retransmission buffering.
-#include "Header.h"   // Shared protocol data types and sender API declarations.
-#include "Channel.h"  // Channel API used to transmit data frames.
+#include <iostream>
+#include "Header.h"
+#include "Channel.h"
+#include "Timer.h"
 
-using namespace std;  // Keeps source compact for educational readability.
-
-// Tracks the sequence number of the oldest unacknowledged frame.
-int base = 0;
-// Tracks the sequence number to assign to the next outgoing frame.
-int next_seq_num = 0;
-
-// Stores already-sent frames by sequence number for potential retransmission.
-vector<Frame> buffer(1000);
-
-// Indicates whether the sender timeout timer is currently active.
-bool timer_running = false;
-// Stores simulation time at which the current timer started.
-int timer_start_time = 0;
-
-// Timeout threshold in milliseconds used for Go-Back-N retransmission.
-const int TIMEOUT = 600;
-
-// Attempts to send one new frame if the sender window has available space.
-bool send_frame(int current_time)
+namespace
 {
-    // Stop when send window [base, base + WINDOW_SIZE) is full.
-    if (next_seq_num >= base + WINDOW_SIZE)
-        return false;
+seq_nr  ack_expected       = 0;   // oldest frame as yet unacknowledged
+seq_nr  next_frame_to_send = 0;   // next frame going out
+int     nbuffered          = 0;   // number of output buffers currently in use
 
-    // Create a frame object for the next sequence number.
-    Frame f;
-    // Write the sequence number that uniquely identifies this frame.
-    f.seq_num = next_seq_num;
-    // Cache frame for retransmission in case of timeout.
-    buffer[next_seq_num] = f;
+packet  buffer[NR_BUFS];          // circular buffer of outbound packets
+unsigned long total_sent_count = 0;
 
-    // Pass frame to channel simulator for delayed/lossy delivery.
-    send_to_channel(f);
-    // Log send event with simulation timestamp.
-    cout << "t=" << current_time << ": Sent frame " << f.seq_num << endl;
+void send_data(seq_nr frame_nr, int current_time)
+{
+    frame s;
+    s.kind    = FK_DATA;
+    s.seq     = frame_nr;
+    // No reverse data flow in this scenario, so we leave the piggybacked ack
+    // field meaningless (set to MAX_SEQ as a never-valid sentinel).
+    s.ack     = MAX_SEQ;
+    s.info    = buffer[frame_nr % NR_BUFS];
+    s.corrupt = false;
 
-    // Start timer only when first unacknowledged frame enters the channel.
-    if (!timer_running)
-    {
-        // Mark timer as active.
-        timer_running = true;
-        // Record timer start time.
-        timer_start_time = current_time;
-    }
+    std::cout << "t=" << current_time
+              << ": SENDER  send DATA seq=" << s.seq
+              << " (payload=" << s.info.data << ")" << std::endl;
 
-    // Advance next sequence number for future sends.
-    next_seq_num++;
-    // Report successful send to caller.
-    return true;
+    send_to_channel(s, DIR_AB, current_time);
+    start_timer(frame_nr, current_time);
+    ++total_sent_count;
+}
 }
 
-// Handles cumulative ACKs delivered from receiver through the channel.
-void receive_ack(int ack_num, int current_time)
+void sender_reset()
 {
-    // Ignore duplicate/old ACKs that do not advance the sender window.
-    if (ack_num < base)
+    ack_expected       = 0;
+    next_frame_to_send = 0;
+    nbuffered          = 0;
+    total_sent_count   = 0;
+    for (int i = 0; i < NR_BUFS; ++i)
+        buffer[i].data = 0;
+}
+
+bool sender_can_accept_packet()
+{
+    return nbuffered < WINDOW_SIZE;
+}
+
+void sender_from_network_layer(packet p, int current_time)
+{
+    // Mirrors the network_layer_ready case in protocol5().
+    buffer[next_frame_to_send % NR_BUFS] = p;
+    nbuffered = nbuffered + 1;
+    send_data(next_frame_to_send, current_time);
+    next_frame_to_send = inc_seq(next_frame_to_send);
+}
+
+void sender_on_frame_arrival(frame f, int current_time)
+{
+    // cksum_err: just ignore bad frames (textbook GBN).
+    if (f.corrupt)
+    {
+        std::cout << "t=" << current_time
+                  << ": SENDER  cksum_err on inbound frame -- ignored"
+                  << std::endl;
         return;
-
-    // Slide window base to first frame not covered by cumulative ACK.
-    base = ack_num + 1;
-
-    // Log ACK arrival for traceability.
-    cout << "t=" << current_time
-         << ": ACK " << ack_num << " received" << endl;
-
-    // If everything sent so far is acknowledged, stop timer.
-    if (base == next_seq_num)
-    {
-        // No outstanding frames remain.
-        timer_running = false;
     }
-    else
+
+    // Cumulative ACK: ack n implies n-1, n-2, ... are also acked.
+    while (between(ack_expected, f.ack, next_frame_to_send))
     {
-        // Outstanding frames remain, so restart timer from this moment.
-        timer_start_time = current_time;
+        nbuffered = nbuffered - 1;
+        stop_timer(ack_expected);
+        std::cout << "t=" << current_time
+                  << ": SENDER  ACK " << ack_expected << " accepted"
+                  << " (window slides; nbuffered=" << (nbuffered) << ")"
+                  << std::endl;
+        ack_expected = inc_seq(ack_expected);
     }
 }
 
-// Checks sender timer and retransmits outstanding frames on timeout.
-void check_timeout(int current_time)
+void sender_on_timeout(seq_nr seq, int current_time)
 {
-    // Skip timeout logic when no outstanding frames exist.
-    if (!timer_running)
-        return;
+    // Tanenbaum's GBN timeout handler: retransmit every outstanding frame.
+    std::cout << "t=" << current_time
+              << ": SENDER  TIMEOUT on seq=" << seq
+              << " -- retransmitting "
+              << nbuffered << " frame(s) starting at seq=" << ack_expected
+              << std::endl;
 
-    // Return early if timeout duration has not elapsed yet.
-    if (current_time - timer_start_time < TIMEOUT)
-        return;
-
-    // Log timeout event before retransmission burst.
-    cout << "t=" << current_time << ": TIMEOUT -> Retransmitting" << endl;
-
-    // Go-Back-N: retransmit every outstanding frame in the current window.
-    for (int i = base; i < next_seq_num; i++)
+    seq_nr s = ack_expected;
+    for (int i = 0; i < nbuffered; ++i)
     {
-        // Log each retransmitted frame sequence number.
-        cout << "t=" << current_time
-             << ": Retransmitting frame " << buffer[i].seq_num << endl;
-        // Re-send cached frame through channel.
-        send_to_channel(buffer[i]);
+        send_data(s, current_time);
+        s = inc_seq(s);
     }
-
-    // Keep timer active after retransmission.
-    timer_running = true;
-    // Restart timer from current simulation time.
-    timer_start_time = current_time;
 }
 
-// Returns sender window base for simulation completion checks.
-int get_sender_base()
+int    sender_nbuffered()           { return nbuffered;          }
+seq_nr sender_ack_expected()        { return ack_expected;       }
+seq_nr sender_next_frame_to_send()  { return next_frame_to_send; }
+unsigned long sender_total_sent()   { return total_sent_count;   }
+
+bool between(seq_nr a, seq_nr b, seq_nr c)
 {
-    // Expose current base value.
-    return base;
+    // Direct port of the textbook helper. True iff a <= b < c circularly.
+    return ((a <= b) && (b < c))
+        || ((c <  a) && (a <= b))
+        || ((b <  c) && (c <  a));
 }
 
-// Returns next sequence number for simulation completion checks.
-int get_sender_next_seq()
+seq_nr inc_seq(seq_nr s)
 {
-    // Expose current next sequence number value.
-    return next_seq_num;
-}
-
-// Resets sender module state for a fresh simulation run.
-void reset_sender()
-{
-    // Reset window base.
-    base = 0;
-    // Reset next outgoing sequence number.
-    next_seq_num = 0;
-    // Stop timer.
-    timer_running = false;
-    // Clear timer start timestamp.
-    timer_start_time = 0;
+    return (s + 1) % (MAX_SEQ + 1);
 }

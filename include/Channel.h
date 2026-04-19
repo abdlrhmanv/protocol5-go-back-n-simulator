@@ -1,50 +1,52 @@
 // =============================================================================
 // Channel.h
 // -----------------------------------------------------------------------------
-// Public API for channel simulation layer.
-//
-// PURPOSE
-//   - Declares callback signatures and channel control functions.
-//   - Defines the bridge between sender/receiver and channel internals.
-//
-// TEAM CONTRACT
-//   - Keep this API stable for all modules.
-//   - Do not add simulation-driver dependencies here.
-//   - If callback signatures change, update registration and implementations.
+// Bidirectional lossy/corrupting/delaying channel between sender (A) and
+// receiver (B). Carries the unified `frame` type in either direction.
 // =============================================================================
 
-#ifndef CHANNEL_H  // Starts include guard for this header.
-#define CHANNEL_H  // Defines include guard macro.
+#ifndef CHANNEL_H
+#define CHANNEL_H
 
-#include "Header.h"  // Imports Frame/Ack definitions shared across modules.
+#include "Header.h"
 
-// Function pointer type for delivering one frame to receiver logic.
-typedef void (*FrameDeliveryCallback)(Frame, int);
+// Direction of travel for a frame handed to the channel.
+enum direction
+{
+    DIR_AB,  // A (sender) -> B (receiver): a data frame
+    DIR_BA   // B (receiver) -> A (sender): an ack-only or piggybacked frame
+};
 
-// Function pointer type for delivering one ACK to sender logic.
-typedef void (*AckDeliveryCallback)(int, int);
+// Callback signature used to deliver a frame to the protocol layer.
+typedef void (*FrameDeliveryCallback)(frame, int);
 
-// Registers the receiver callback used when frame delivery time expires.
-void register_receiver(FrameDeliveryCallback cb);
+// Register the receiver's frame_arrival handler (A -> B direction).
+void register_a_to_b(FrameDeliveryCallback cb);
 
-// Registers the sender callback used when ACK delivery time expires.
-void register_sender_ack(AckDeliveryCallback cb);
+// Register the sender's frame_arrival handler (B -> A direction).
+void register_b_to_a(FrameDeliveryCallback cb);
 
-// Sets frame loss probability percentage used by channel model.
+// Probability (0..100) that the channel silently drops a frame.
 void set_frame_loss_probability(double percent);
-// Sets ACK loss probability percentage used by channel model.
-void set_ack_loss_probability(double percent);
 
-// Updates channel's current simulation time.
-void set_channel_time(int current_time);
+// Probability (0..100) that the channel corrupts a frame. A corrupted frame
+// is delivered as the same frame structure but flagged so the protocol layer
+// can model a `cksum_err` event (per Tanenbaum, GBN ignores bad frames).
+void set_frame_corrupt_probability(double percent);
 
-// Accepts one sender frame and schedules it for delayed delivery/drop.
-void send_to_channel(Frame f);
+// Seed the channel's PRNG for reproducible simulations. Pass 0 to seed from
+// wall-clock time.
+void channel_seed(unsigned int seed);
 
-// Accepts one receiver ACK and schedules it for delayed delivery/drop.
-void send_ack_to_channel(Ack a);
+// Hand a frame to the channel for delivery. The channel logs acceptance,
+// applies loss/corruption, and schedules delivery after TRANSMISSION_TIME +
+// PROP_DELAY ms.
+void send_to_channel(frame f, direction d, int current_time);
 
-// Processes frame/ACK queues and delivers all packets due at this time.
+// Deliver every frame whose scheduled delivery time has been reached.
 void process_channel(int current_time);
 
-#endif  // Ends include guard.
+// Discard all in-flight frames and reset PRNG-independent state.
+void channel_reset();
+
+#endif
